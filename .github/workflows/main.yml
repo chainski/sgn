@@ -1,44 +1,130 @@
-
-name: build
+name: SGN
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+permissions:
+  contents: write
+  pull-requests: write
+  repository-projects: write
 
 jobs:
-  macos-run:
-    runs-on: macos-latest
-    steps:
-    - uses: actions/checkout@v3
-    - name: Set up Go
-      uses: actions/setup-go@v3
-      with:
-        go-version: 1.21
-    - name: Make Build
-      run: make
-    - name: Test Run
-      run: ./build/sgn --version
-  linux-run:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v3
-    - name: Set up Go
-      uses: actions/setup-go@v3
-      with:
-        go-version: 1.21
-    - name: Make Build
-      run: make
-    - name: Test Run
-      run: ./build/sgn --version
-  windows-run:
+  build:
     runs-on: windows-latest
+
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
+
     - name: Set up Go
-      uses: actions/setup-go@v3
+      uses: actions/setup-go@v5
       with:
-        go-version: 1.21
-    - name: Make Build
-      run: make
-    - name: Test Run
-      run: ./build/sgn.exe --version
+        go-version: '1.26'
+
+    - name: Download MinGW
+      run: |
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri https://github.com/brechtsanders/winlibs_mingw/releases/download/16.1.0posix-14.0.0-ucrt-r3/winlibs-x86_64-posix-seh-gcc-16.1.0-mingw-w64ucrt-14.0.0-r3.7z -OutFile mingw.7z
+      shell: powershell
+
+    - name: Extract MinGW
+      run: 7z x mingw.7z -oC:\mingw -y > nul
+      shell: cmd
+
+    - name: Download older CMake
+      run: |
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri https://github.com/Kitware/CMake/releases/download/v3.25.3/cmake-3.25.3-windows-x86_64.zip -OutFile cmake.zip
+      shell: powershell
+
+    - name: Extract CMake
+      run: 7z x cmake.zip -oC:\cmake -y > nul
+      shell: cmd
+
+    - name: Set up environment
+      run: |
+        echo "C:\mingw\bin" >> $env:GITHUB_PATH
+        echo "C:\cmake\cmake-3.25.3-windows-x86_64\bin" >> $env:GITHUB_PATH
+      shell: powershell
+
+    - name: Verify GCC and CMake
+      run: |
+        gcc --version
+        cmake --version
+
+    - name: Clone and build Keystone (static)
+      run: |
+        git clone --depth=1 --quiet https://github.com/keystone-engine/keystone.git
+        cd keystone
+        mkdir build
+        cd build
+        cmake -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DKEYSTONE_BUILD_STATIC_RUNTIME=ON .. >nul 2>&1
+        rmdir /s /q kstool
+        mingw32-make keystone -j4
+      shell: cmd
+
+    - name: Prepare Keystone library
+      run: |
+        copy keystone\build\llvm\lib\libkeystone.a .
+        dir libkeystone.a
+      shell: cmd
+
+    - name: Build SGN (static)
+      run: |
+        $env:GOOS="windows"
+        $env:GOARCH="amd64"
+        $env:CGO_ENABLED="1"
+        $env:CC="gcc"
+        $env:CGO_CFLAGS="-I${{ github.workspace }}\keystone\include"
+        $env:CGO_LDFLAGS="-L${{ github.workspace }} -lkeystone -static -lole32 -lshell32 -luuid"
+        go build -v -o sgn.exe -trimpath -buildvcs=false `
+          -ldflags="-s -w -extldflags '-static' -X github.com/EgeBalci/sgn/config.Version=v2.0.2"
+      shell: powershell
+
+    - name: Verify build (run sgn -h)
+      run: .\sgn.exe -h
+      shell: cmd
+
+    - name: Create release archive
+      run: |
+        7z a -tzip sgn_windows_amd64_2.0.2.zip sgn.exe
+      shell: cmd
+
+    - name: Generate SHA256
+      id: sha
+      run: |
+        $hash = (Get-FileHash -Algorithm SHA256 .\sgn_windows_amd64_2.0.2.zip).Hash.ToLower()
+        "sha256=$hash" >> $env:GITHUB_OUTPUT
+      shell: powershell
+
+    - name: Delete existing tag and release
+      uses: dev-drprasad/delete-tag-and-release@v1.1
+      with:
+        tag_name: v2.0.2
+        delete_release: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Create Release and Upload Asset
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v2.0.2
+        name: SGN v2.0.2
+        body: |
+          #### Full Changelog https://github.com/EgeBalci/sgn/releases/tag/v2.0.2
+           
+          - [x] 64 bit support. `Finally properly encoded x64 shellcodes !`
+          - [x] New smaller decoder stub. `LFSR key reduced to 1 byte`
+          - [x] Encoded stub with pseudo random schema. `Decoder stub is also encoded with a psudo random schema`
+          - [x] No visible loop condition `Stub decodes itself WITHOUT using any loop conditions !!` 
+          - [x] Decoder stub obfuscation. `Random garbage instruction generator added with keystone`
+          - [x] Safe register option. `Non of the registers are clobbered (optional preable, may reduce polimorphism)` 
+         
+          **SHA256:** `${{ steps.sha.outputs.sha256 }}`  `sgn_windows_amd64_2.0.2.zip`
+        files: sgn_windows_amd64_2.0.2.zip
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
